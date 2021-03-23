@@ -99,7 +99,7 @@ class PTBR(implicit p: Parameters) extends CoreBundle()(p) {
     case 64 => (4, 16)
   }
   require(modeBits + maxASIdBits + maxPAddrBits - pgIdxBits == xLen)
-
+  // Values in SATP Register
   val mode = UInt(width = modeBits)
   val asid = UInt(width = maxASIdBits)
   val ppn = UInt(width = maxPAddrBits - pgIdxBits)

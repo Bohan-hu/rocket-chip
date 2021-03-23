@@ -31,12 +31,13 @@ class PTWResp(implicit p: Parameters) extends CoreBundle()(p) {
 
 class TLBPTWIO(implicit p: Parameters) extends CoreBundle()(p)
     with HasCoreParameters {
-  val req = Decoupled(Valid(new PTWReq))
-  val resp = Valid(new PTWResp).flip
-  val ptbr = new PTBR().asInput
-  val status = new MStatus().asInput
-  val pmp = Vec(nPMPs, new PMP).asInput
-  val customCSRs = coreParams.customCSRs.asInput
+      // On TLB miss, the TLB send request to PTW
+      val req = Decoupled(Valid(new PTWReq)) // TLB -> PTW
+      val resp = Valid(new PTWResp).flip     // PTW -> TLB
+      val ptbr = new PTBR().asInput          // SATP register
+      val status = new MStatus().asInput     // MStatus -> PTW
+      val pmp = Vec(nPMPs, new PMP).asInput
+      val customCSRs = coreParams.customCSRs.asInput
 }
 
 class PTWPerfEvents extends Bundle {
@@ -69,18 +70,19 @@ class PTE(implicit p: Parameters) extends CoreBundle()(p) {
   val r = Bool()
   val v = Bool()
 
-  def table(dummy: Int = 0) = v && !r && !w && !x
-  def leaf(dummy: Int = 0) = v && (r || (x && !w)) && a
+  def table(dummy: Int = 0) = v && !r && !w && !x        // PTE is not a leaf
+  def leaf(dummy: Int = 0) = v && (r || (x && !w)) && a  // We need to get rid of A here
   def ur(dummy: Int = 0) = sr() && u
   def uw(dummy: Int = 0) = sw() && u
   def ux(dummy: Int = 0) = sx() && u
   def sr(dummy: Int = 0) = leaf() && r
-  def sw(dummy: Int = 0) = leaf() && w && d
+  def sw(dummy: Int = 0) = leaf() && w && d              // We need to get rid of D here
   def sx(dummy: Int = 0) = leaf() && x
 }
 
 class L2TLBEntry(nSets: Int)(implicit p: Parameters) extends CoreBundle()(p)
     with HasCoreParameters {
+  // L2 TLB sits within the PTW
   val idxBits = log2Ceil(nSets)
   val tagBits = vpnBits - idxBits
   val tag = UInt(width = tagBits)
@@ -98,42 +100,50 @@ class L2TLBEntry(nSets: Int)(implicit p: Parameters) extends CoreBundle()(p)
 @chiselName
 class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(p) {
   val io = new Bundle {
-    val requestor = Vec(n, new TLBPTWIO).flip
-    val mem = new HellaCacheIO
+    val requestor = Vec(n, new TLBPTWIO).flip // request from TLBs
+    val mem = new HellaCacheIO                // request to Memory (DCache)
     val dpath = new DatapathPTWIO
   }
 
+  // SRAMs for Storing the L2 TLB Entries
   val omSRAMs = collection.mutable.ListBuffer[OMSRAM]()
 
-  val s_ready :: s_req :: s_wait1 :: s_dummy1 :: s_wait2 :: s_wait3 :: s_dummy2 :: s_fragment_superpage :: Nil = Enum(UInt(), 8)
+  // States for page table walks
+  val s_ready :: s_req :: s_wait1 :: s_dummy1 :: s_wait2 :: s_wait3 :: s_dummy2 :: s_fragment_superpage :: Nil = Enum(UInt(), 8) // dummy is not useful
   val state = Reg(init=s_ready)
   val l2_refill_wire = Wire(Bool())
 
+  // Arbiter for different PTW requests
   val arb = Module(new Arbiter(Valid(new PTWReq), n))
-  arb.io.in <> io.requestor.map(_.req)
+  arb.io.in <> io.requestor.map(_.req)     // Request from TLBs are sent to arbiter
   arb.io.out.ready := (state === s_ready) && !l2_refill_wire
 
+  // TODO 
   val resp_valid = Reg(next = Vec.fill(io.requestor.size)(Bool(false)))
 
+  // Clock gating
   val clock_en = state =/= s_ready || l2_refill_wire || arb.io.out.valid || io.dpath.sfence.valid || io.dpath.customCSRs.disableDCacheClockGate
   io.dpath.clock_enabled := usingVM && clock_en
   val gated_clock =
     if (!usingVM || !tileParams.dcache.get.clockGate) clock
     else ClockGate(clock, clock_en, "ptw_clock_gate")
-  withClock (gated_clock) { // entering gated-clock domain
+  withClock (gated_clock) {                       // entering gated-clock domain
 
   val invalidated = Reg(Bool())
   val count = Reg(UInt(width = log2Up(pgLevels)))
-  val resp_ae = RegNext(false.B)
-  val resp_fragmented_superpage = RegNext(false.B)
+  // Signals starts with resp_ stands for response to TLB
+  val resp_ae = RegNext(false.B)                  // Response address exception
+  val resp_fragmented_superpage = RegNext(false.B) // The response is a fragmented superpage
 
-  val r_req = Reg(new PTWReq)
-  val r_req_dest = Reg(Bits())
-  val r_pte = Reg(new PTE)
+  // Regs for storing the request and the source of the request
+  val r_req = Reg(new PTWReq)  // regs for PTW request ( request to PTW )
+  val r_req_dest = Reg(Bits()) // the source of the request ( I or D )
+  val r_pte = Reg(new PTE)     // regs for a PTE entry
 
+  // Handle the response from memory port (both cached and uncached)
   val mem_resp_valid = RegNext(io.mem.resp.valid)
   val mem_resp_data = RegNext(io.mem.resp.bits.data)
-  io.mem.uncached_resp.map { resp =>
+  io.mem.uncached_resp.map { resp =>                 // Maybe have different uncached resp ports
     assert(!(resp.valid && io.mem.resp.valid))
     resp.ready := true
     when (resp.valid) {
@@ -142,18 +152,20 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     }
   }
 
+  // Check the misaligned superpages
+  // Convert data from memory to PTE type
   val (pte, invalid_paddr) = {
     val tmp = new PTE().fromBits(mem_resp_data)
     val res = Wire(init = tmp)
     res.ppn := tmp.ppn(ppnBits-1, 0)
-    when (tmp.r || tmp.w || tmp.x) {
+    when (tmp.r || tmp.w || tmp.x) {    // RWX means the leaf nodes
       // for superpage mappings, make sure PPN LSBs are zero
       for (i <- 0 until pgLevels-1)
         when (count <= i && tmp.ppn((pgLevels-1-i)*pgLevelBits-1, (pgLevels-2-i)*pgLevelBits) =/= 0) { res.v := false }
     }
     (res, (tmp.ppn >> ppnBits) =/= 0)
   }
-  val traverse = pte.table() && !invalid_paddr && count < pgLevels-1
+  // the address of PTE in next level
   val pte_addr = if (!usingVM) 0.U else {
     val vpn_idxs = (0 until pgLevels).map(i => (r_req.addr >> (pgLevels-i-1)*pgLevelBits)(pgLevelBits-1,0))
     val vpn_idx = vpn_idxs(count)
@@ -164,26 +176,35 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
     choices(count)
   }
 
+  // Store the source of request
   when (arb.io.out.fire()) {
     r_req := arb.io.out.bits.bits
     r_req_dest := arb.io.chosen
   }
 
+  // The L2 TLB inside the PTW using PLRU replacement policy (TODO)(DONTCARE)
+  // Small PTE Cache ( registers )
+  // Storing PTE (not only the leaves, but also the page directory)
+  val traverse = pte.table() && !invalid_paddr && count < pgLevels-1
   val (pte_cache_hit, pte_cache_data) = {
     val size = 1 << log2Up(pgLevels * 2)
-    val plru = new PseudoLRU(size)
+    val plru = new PseudoLRU(size)        // Replacement Policy is an abstract class, PseudoLRU extends from it
+    // It's not a real module, but a class with a state register and a method for reading that register
     val valid = RegInit(0.U(size.W))
+    // Register file for strong data
     val tags = Reg(Vec(size, UInt(width = paddrBits)))
     val data = Reg(Vec(size, UInt(width = ppnBits)))
 
-    val hits = tags.map(_ === pte_addr).asUInt & valid
-    val hit = hits.orR
+    val hits = tags.map(_ === pte_addr).asUInt & valid   // Vector for hits signals
+    val hit = hits.orR                                   // Reduced-or for hit signals
+    // Inserting a new entry into the PTE Cache ( page directory entry ) 
     when (mem_resp_valid && traverse && !hit && !invalidated) {
-      val r = Mux(valid.andR, plru.way, PriorityEncoder(~valid))
+      val r = Mux(valid.andR, plru.way, PriorityEncoder(~valid))  // If has nothing valid, just replace the first line, or use the plru logic
       valid := valid | UIntToOH(r)
       tags(r) := pte_addr
       data(r) := pte.ppn
     }
+    // Give PLRU logic hints about access
     when (hit && state === s_req) { plru.access(OHToUInt(hits)) }
     when (io.dpath.sfence.valid && !io.dpath.sfence.bits.rs1) { valid := 0.U }
 
@@ -198,10 +219,12 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   assert(!(io.dpath.perf.l2hit && (io.dpath.perf.pte_miss || io.dpath.perf.pte_hit)),
     "PTE Cache Hit/Miss Performance Monitor Events are lower priority than L2TLB Hit event")
 
+  // L2 TLB (only stores the leaf PTEs)
   val l2_refill = RegNext(false.B)
   l2_refill_wire := l2_refill
   io.dpath.perf.l2miss := false
   io.dpath.perf.l2hit := false
+  // Logic for L2 TLB
   val (l2_hit, l2_error, l2_pte, l2_tlb_ram) = if (coreParams.nL2TLBEntries == 0) (false.B, false.B, Wire(new PTE), None) else {
     val code = new ParityCode
     require(isPow2(coreParams.nL2TLBEntries))
@@ -284,17 +307,19 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   // if SFENCE occurs during walk, don't refill PTE cache or L2 TLB until next walk
   invalidated := io.dpath.sfence.valid || (invalidated && state =/= s_ready)
 
-  io.mem.req.valid := state === s_req || state === s_dummy1
+  // Note HERE! PTW FSM here
+  io.mem.req.valid := state === s_req || state === s_dummy1  // The request is sent regardless of whether the pte cache hits, because the request is killable
   io.mem.req.bits.phys := Bool(true)
-  io.mem.req.bits.cmd  := M_XRD
+  io.mem.req.bits.cmd  := M_XRD       // bits_cmd can be M_PTWLR / M_PTWSC 
   io.mem.req.bits.size := log2Ceil(xLen/8)
   io.mem.req.bits.signed := false
   io.mem.req.bits.addr := pte_addr
   io.mem.req.bits.idx.foreach(_ := pte_addr)
   io.mem.req.bits.dprv := PRV.S.U   // PTW accesses are S-mode by definition
-  io.mem.s1_kill := l2_hit || state =/= s_wait1
+  io.mem.s1_kill := l2_hit || state =/= s_wait1  // When l2 tlb hits, kill the request from s1 or when state != wait1, means the pte cache hits 
   io.mem.s2_kill := Bool(false)
 
+  // PMA/PMP Check
   val pageGranularityPMPs = pmpGranularity >= (1 << pgIdxBits)
   val pmaPgLevelHomogeneous = (0 until pgLevels) map { i =>
     val pgSize = BigInt(1) << (pgIdxBits + ((pgLevels - 1 - i) * pgLevelBits))
@@ -309,6 +334,7 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   val pmpHomogeneous = new PMPHomogeneityChecker(io.dpath.pmp).apply(pte_addr >> pgIdxBits << pgIdxBits, count)
   val homogeneous = pmaHomogeneous && pmpHomogeneous
 
+  // Assign values to response 
   for (i <- 0 until io.requestor.size) {
     io.requestor(i).resp.valid := resp_valid(i)
     io.requestor(i).resp.bits.ae := resp_ae
@@ -326,32 +352,39 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
   val next_state = Wire(init = state)
   state := OptimizationBarrier(next_state)
 
+  // Note to modify here, the state machine
   switch (state) {
     is (s_ready) {
-      when (arb.io.out.fire()) {
+      when (arb.io.out.fire()) {   // Can cancel the request by deasserting the valid ?
         next_state := Mux(arb.io.out.bits.valid, s_req, s_ready)
       }
       count := pgLevels - minPgLevels - io.dpath.ptbr.additionalPgLevels
     }
     is (s_req) {
-      when (pte_cache_hit) {
+      when (pte_cache_hit) {  // Small cache hit
         count := count + 1
-        pte_hit := true
+        pte_hit := true       // Performance Counter, Doesn't matter
       }.otherwise {
-        next_state := Mux(io.mem.req.ready, s_wait1, s_req)
+        next_state := Mux(io.mem.req.ready, s_wait1, s_req)       // TODO: The request is recalled? Or look up the secondary cache
       }
     }
     is (s_wait1) {
-      // This Mux is for the l2_error case; the l2_hit && !l2_error case is overriden below
-      next_state := Mux(l2_hit, s_req, s_wait2)
+      // This Mux is for the l2_error case; the l2_hit && !l2_error case is overriden below (Plz Notice)
+      next_state := Mux(l2_hit, s_req, s_wait2) // If l2 is error, Goto req state. else goto s_wait2
+      // This is for the l2_hit and not error
+      // assert(state === s_req || state === s_wait1)
+      // next_state := s_ready
+      // resp_valid(r_req_dest) := true // Return the result directly
+      // resp_ae := false
+      // count := pgLevels-1
     }
-    is (s_wait2) {
-      next_state := s_wait3
-      io.dpath.perf.pte_miss := count < pgLevels-1
-      when (io.mem.s2_xcpt.ae.ld) {
+    is (s_wait2) {         // If the secondary cache is not hit, or has an error on it
+      next_state := s_wait3   // Where is s_wait3 ??? 
+      io.dpath.perf.pte_miss := count < pgLevels-1  // Performance Counter (Dont care)
+      when (io.mem.s2_xcpt.ae.ld) {  // Access Memory: Access Exception
         resp_ae := true
         next_state := s_ready
-        resp_valid(r_req_dest) := true
+        resp_valid(r_req_dest) := true   // Respond to proper destination
       }
     }
     is (s_fragment_superpage) {
@@ -360,37 +393,41 @@ class PTW(n: Int)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(
       resp_ae := false
       when (!homogeneous) {
         count := pgLevels-1
-        resp_fragmented_superpage := true
+        resp_fragmented_superpage := true // Need a cycle to deal with the superpage
       }
     }
   }
 
-  def makePTE(ppn: UInt, default: PTE) = {
+  def makePTE(ppn: UInt, default: PTE) = {   // Make a PTE using the template provided by default
     val pte = Wire(init = default)
     pte.ppn := ppn
     pte
   }
-  r_pte := OptimizationBarrier(
-    Mux(mem_resp_valid, pte,
-    Mux(l2_hit && !l2_error, l2_pte,
-    Mux(state === s_fragment_superpage && !homogeneous, makePTE(fragmented_superpage_ppn, r_pte),
+  r_pte := OptimizationBarrier(           // Make such logic an independent module ( I guess so? )
+    Mux(mem_resp_valid, pte,              // If memory response is valid, then the PTE shoubld be from memory resp data
+    Mux(l2_hit && !l2_error, l2_pte,      // If L2 TLB hits, then the pte reg should be the one in tlb
+    Mux(state === s_fragment_superpage && !homogeneous, makePTE(fragmented_superpage_ppn, r_pte),  // If is a fragmented_superpage,
     Mux(state === s_req && pte_cache_hit, makePTE(pte_cache_data, l2_pte),
     Mux(arb.io.out.fire(), makePTE(io.dpath.ptbr.ppn, r_pte),
     r_pte))))))
 
-  when (l2_hit && !l2_error) {
+  when (l2_hit && !l2_error) {   // Override the next_state in L2 hit in last state machine
     assert(state === s_req || state === s_wait1)
     next_state := s_ready
     resp_valid(r_req_dest) := true
     resp_ae := false
     count := pgLevels-1
   }
-  when (mem_resp_valid) {
+  // TODO: Modify Here, Update the A Bit
+  // Notice: the s_wait3 state is handled here
+  // Still need to traverse to lower layers, not a leaf PTE
+  when (mem_resp_valid) { 
     assert(state === s_wait3)
-    when (traverse) {
+    when (traverse) { // Not a leaf PTE
       next_state := s_req
       count := count + 1
-    }.otherwise {
+    }.otherwise {  // A leaf PTE has been found
+      // (invalid_paddr = (tmp.ppn >> ppnBits) =/= 0)
       l2_refill := pte.v && !invalid_paddr && count === pgLevels-1
       val ae = pte.v && invalid_paddr
       resp_ae := ae

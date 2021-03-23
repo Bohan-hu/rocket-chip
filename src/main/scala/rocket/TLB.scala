@@ -19,6 +19,7 @@ import chisel3.internal.sourceinfo.SourceInfo
 case object PgLevels extends Field[Int](2)
 case object ASIdBits extends Field[Int](0)
 
+// SFence request signals
 class SFenceReq(implicit p: Parameters) extends CoreBundle()(p) {
   val rs1 = Bool()
   val rs2 = Bool()
@@ -26,6 +27,7 @@ class SFenceReq(implicit p: Parameters) extends CoreBundle()(p) {
   val asid = UInt(width = asIdBits max 1) // TODO zero-width
 }
 
+// Request to TLB
 class TLBReq(lgMaxSize: Int)(implicit p: Parameters) extends CoreBundle()(p) {
   val vaddr = UInt(width = vaddrBitsExtended)
   val passthrough = Bool()
@@ -35,16 +37,19 @@ class TLBReq(lgMaxSize: Int)(implicit p: Parameters) extends CoreBundle()(p) {
   override def cloneType = new TLBReq(lgMaxSize).asInstanceOf[this.type]
 }
 
+// TLB Exception source
 class TLBExceptions extends Bundle {
   val ld = Bool()
   val st = Bool()
   val inst = Bool()
 }
 
+// Response to Top level
 class TLBResp(implicit p: Parameters) extends CoreBundle()(p) {
   // lookup responses
-  val miss = Bool()
-  val paddr = UInt(width = paddrBits)
+  val miss = Bool()                     // TLB Miss
+  val paddr = UInt(width = paddrBits)   // Translated Paddr
+  // TLB exceptions: page fault, address error, misaligned
   val pf = new TLBExceptions
   val ae = new TLBExceptions
   val ma = new TLBExceptions
@@ -58,7 +63,7 @@ class TLBEntryData(implicit p: Parameters) extends CoreBundle()(p) {
   val u = Bool()
   val g = Bool()
   val ae = Bool()
-  val sw = Bool()
+  val sw = Bool()      // Note: SW is defined as 
   val sx = Bool()
   val sr = Bool()
   val pw = Bool()
@@ -72,14 +77,17 @@ class TLBEntryData(implicit p: Parameters) extends CoreBundle()(p) {
   val fragmented_superpage = Bool()
 }
 
+// Definitions and operations of TLB entries
 class TLBEntry(val nSectors: Int, val superpage: Boolean, val superpageOnly: Boolean)(implicit p: Parameters) extends CoreBundle()(p) {
   require(nSectors == 1 || !superpage)
   require(!superpageOnly || superpage)
 
+  // Actually Store the data
   val level = UInt(width = log2Ceil(pgLevels))
   val tag = UInt(width = vpnBits)
   val data = Vec(nSectors, UInt(width = new TLBEntryData().getWidth))
   val valid = Vec(nSectors, Bool())
+  // Helpers to get truncated words
   def entry_data = data.map(_.asTypeOf(new TLBEntryData))
 
   private def sectorIdx(vpn: UInt) = vpn.extract(nSectors.log2-1, 0)
@@ -100,6 +108,7 @@ class TLBEntry(val nSectors: Int, val superpage: Boolean, val superpageOnly: Boo
       valid(idx) && sectorTagMatch(vpn)
     }
   }
+  // Extract the PPN
   def ppn(vpn: UInt) = {
     val data = getData(vpn)
     if (superpage && usingVM) {
@@ -152,8 +161,8 @@ case class TLBConfig(
 
 class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: TLEdgeOut, p: Parameters) extends CoreModule()(p) {
   val io = new Bundle {
-    val req = Decoupled(new TLBReq(lgMaxSize)).flip
-    val resp = new TLBResp().asOutput
+    val req = Decoupled(new TLBReq(lgMaxSize)).flip  // Request to TLB
+    val resp = new TLBResp().asOutput                // Response from TLB
     val sfence = Valid(new SFenceReq).asInput
     val ptw = new TLBPTWIO
     val kill = Bool(INPUT) // suppress a TLB refill, one cycle after a miss
@@ -162,6 +171,7 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   val pageGranularityPMPs = pmpGranularity >= (1 << pgIdxBits)
   val vpn = io.req.bits.vaddr(vaddrBits-1, pgIdxBits)
   val memIdx = vpn.extract(cfg.nSectors.log2 + cfg.nSets.log2 - 1, cfg.nSectors.log2)
+  // Store of the TLB Entries (Regs)
   val sectored_entries = Reg(Vec(cfg.nSets, Vec(cfg.nWays / cfg.nSectors, new TLBEntry(cfg.nSectors, false, false))))
   val superpage_entries = Reg(Vec(cfg.nSuperpageEntries, new TLBEntry(1, true, true)))
   val special_entry = (!pageGranularityPMPs).option(Reg(new TLBEntry(1, true, false)))
@@ -184,8 +194,13 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
 
   // share a single physical memory attribute checker (unshare if critical path)
   val refill_ppn = io.ptw.resp.bits.pte.ppn(ppnBits-1, 0)
-  val do_refill = Bool(usingVM) && io.ptw.resp.valid
-  val invalidate_refill = state.isOneOf(s_request /* don't care */, s_wait_invalidate) || io.sfence.valid
+  // Maybe we should modify the state machine between tlb and ptw
+  // TLB should ask PTW to update the D bit in memory rather than reporting a page fault
+  // This can be done by adding a state to the state machine: when resp.pf.st, and it was caused by D bit
+  // Ask PTW to update, on success, update the TLB either
+  // When TLB hit, and D bit was not set, ask PTW to set the D bit in memory
+  val do_refill = Bool(usingVM) && io.ptw.resp.valid // When response is valid, do the refill 
+  val invalidate_refill = state.isOneOf(s_request /* don't care */, s_wait_invalidate) || io.sfence.valid    // Invalidate request from different stages
   val mpu_ppn = Mux(do_refill, refill_ppn,
                 Mux(vm_enabled && special_entry.nonEmpty, special_entry.map(_.ppn(vpn)).getOrElse(0.U), io.req.bits.vaddr >> pgIdxBits))
   val mpu_physaddr = Cat(mpu_ppn, io.req.bits.vaddr(pgIdxBits-1, 0))
@@ -201,6 +216,7 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   val cacheable = fastCheck(_.supportsAcquireT) && (instruction || !usingDataScratchpad)
   val homogeneous = TLBPageLookup(edge.manager.managers, xLen, p(CacheBlockBytes), BigInt(1) << pgIdxBits)(mpu_physaddr).homogeneous
   val deny_access_to_debug = mpu_priv <= PRV.M && p(DebugModuleKey).map(dmp => dmp.address.contains(mpu_physaddr)).getOrElse(false)
+  // What is FastCheck?
   val prot_r = fastCheck(_.supportsGet) && !deny_access_to_debug && pmp.io.r
   val prot_w = fastCheck(_.supportsPutFull) && !deny_access_to_debug && pmp.io.w
   val prot_pp = fastCheck(_.supportsPutPartial)
@@ -258,14 +274,16 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
     }
   }
 
-  val entries = all_entries.map(_.getData(vpn))
+  val entries = all_entries.map(_.getData(vpn))                  // Extract VPNs from Entries
   val normal_entries = ordinary_entries.map(_.getData(vpn))
   val nPhysicalEntries = 1 + special_entry.size
   val ptw_ae_array = Cat(false.B, entries.map(_.ae).asUInt)
   val priv_rw_ok = Mux(!priv_s || io.ptw.status.sum, entries.map(_.u).asUInt, 0.U) | Mux(priv_s, ~entries.map(_.u).asUInt, 0.U)
   val priv_x_ok = Mux(priv_s, ~entries.map(_.u).asUInt, entries.map(_.u).asUInt)
+  // SW is defined as leaf & w & d
+  // Note: def leaf(dummy: Int = 0) = v && (r || (x && !w)) && a
   val r_array = Cat(true.B, priv_rw_ok & (entries.map(_.sr).asUInt | Mux(io.ptw.status.mxr, entries.map(_.sx).asUInt, UInt(0))))
-  val w_array = Cat(true.B, priv_rw_ok & entries.map(_.sw).asUInt)
+  val w_array = Cat(true.B, priv_rw_ok & entries.map(_.sw).asUInt)   
   val x_array = Cat(true.B, priv_x_ok & entries.map(_.sx).asUInt)
   val pr_array = Cat(Fill(nPhysicalEntries, prot_r), normal_entries.map(_.pr).asUInt) & ~ptw_ae_array
   val pw_array = Cat(Fill(nPhysicalEntries, prot_w), normal_entries.map(_.pw).asUInt) & ~ptw_ae_array
@@ -281,6 +299,7 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   val prefetchable_array = Cat((cacheable && homogeneous) << (nPhysicalEntries-1), normal_entries.map(_.c).asUInt)
 
   val misaligned = (io.req.bits.vaddr & (UIntToOH(io.req.bits.size) - 1)).orR
+  // Bad_va: the topmost bits of the VA is not 1, cause a page fault here
   val bad_va = if (!usingVM || (minPgLevels == pgLevels && vaddrBits == vaddrBitsExtended)) false.B else vm_enabled && {
     val nPgLevelChoices = pgLevels - minPgLevels + 1
     val minVAddrBits = pgIdxBits + minPgLevels * pgLevelBits
@@ -296,7 +315,7 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
   val cmd_amo_arithmetic = Bool(usingAtomics) && isAMOArithmetic(io.req.bits.cmd)
   val cmd_put_partial = io.req.bits.cmd === M_PWR
   val cmd_read = isRead(io.req.bits.cmd)
-  val cmd_write = isWrite(io.req.bits.cmd)
+  val cmd_write = isWrite(io.req.bits.cmd)      // Note Here, Page fault is related to this signal
   val cmd_write_perms = cmd_write ||
     io.req.bits.cmd.isOneOf(M_FLUSH_ALL, M_WOK) // not a write, but needs write permissions
 
@@ -317,8 +336,9 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
     Mux(cmd_lrsc, ~0.U(pal_array.getWidth.W), 0.U)
   val ma_ld_array = Mux(misaligned && cmd_read, ~eff_array, 0.U)
   val ma_st_array = Mux(misaligned && cmd_write, ~eff_array, 0.U)
+  // TODO: Notice Here, to change the condition of pf_ld/st
   val pf_ld_array = Mux(cmd_read, ~(r_array | ptw_ae_array), 0.U)
-  val pf_st_array = Mux(cmd_write_perms, ~(w_array | ptw_ae_array), 0.U)
+  val pf_st_array = Mux(cmd_write_perms, ~(w_array | ptw_ae_array), 0.U)   // Array for entries causing PF ( when requires to write, use this)
   val pf_inst_array = ~(x_array | ptw_ae_array)
 
   val tlb_hit = real_hits.orR
@@ -340,6 +360,12 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
 
   io.req.ready := state === s_ready
   io.resp.pf.ld := (bad_va && cmd_read) || (pf_ld_array & hits).orR
+  // Notice Here, we should focus on cmd_write_perms
+  // Conditions:
+  // Bad_va: high order bits beyond VA is not all 1's
+  // cmd_write_perm:
+  // pf_st_array & hits:
+  // TODO: Note the pf_st_array, why it uses an array?
   io.resp.pf.st := (bad_va && cmd_write_perms) || (pf_st_array & hits).orR
   io.resp.pf.inst := bad_va || (pf_inst_array & hits).orR
   io.resp.ae.ld := (ae_ld_array & hits).orR
@@ -371,13 +397,13 @@ class TLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: T
     }
     when (state === s_request) {
       when (sfence) { state := s_ready }
-      when (io.ptw.req.ready) { state := Mux(sfence, s_wait_invalidate, s_wait) }
+      when (io.ptw.req.ready) { state := Mux(sfence, s_wait_invalidate, s_wait) }  // the request cannot be killed (TLB -> PTW)
       when (io.kill) { state := s_ready }
     }
     when (state === s_wait && sfence) {
-      state := s_wait_invalidate
+      state := s_wait_invalidate // Invalidate
     }
-    when (io.ptw.resp.valid) {
+    when (io.ptw.resp.valid) {   // s_wait_invalidate is handled here, not explicitly handled
       state := s_ready
     }
 
